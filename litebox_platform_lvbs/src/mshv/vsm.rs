@@ -9,9 +9,11 @@ use crate::mshv::ringbuffer::set_ringbuffer;
 use crate::{
     debug_serial_println,
     host::{
+        PRK_LEN,
         bootparam::get_vtl1_memory_info,
         linux::{CpuMask, KEXEC_SEGMENT_MAX, Kimage},
         per_cpu_variables::with_per_cpu_variables,
+        set_platform_root_key,
     },
     mshv::{
         HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
@@ -56,6 +58,7 @@ use x86_64::{
 };
 use x509_cert::{Certificate, der::Decode};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
+use zeroize::Zeroizing;
 
 #[derive(Copy, Clone, FromBytes, Immutable, KnownLayout)]
 #[repr(align(4096))]
@@ -894,6 +897,28 @@ fn mshv_vsm_allocate_ringbuffer_memory(phys_addr: u64, size: usize) -> Result<i6
     Ok(0)
 }
 
+/// This function sets the platform root key by copying key data from VTL0.
+///
+/// - `key_pa`: Physical address (VTL0) that the platform root key is stored at.
+///
+/// This function assumes that the caller stores key bytes in a single or
+/// contiguous physical memory page(s), whose length is equal to `PRK_LEN`.
+fn mshv_vsm_set_platform_root_key(key_pa: u64) -> Result<i64, VsmError> {
+    if crate::platform_low().vtl0_kernel_info.check_end_of_boot() {
+        return Err(VsmError::OperationAfterEndOfBoot("set platform root key"));
+    }
+
+    let key_pa = PhysAddr::try_new(key_pa).map_err(|_| VsmError::InvalidPhysicalAddress)?;
+
+    let mut keybuf = Zeroizing::new([0u8; PRK_LEN]);
+    if unsafe { crate::platform_low().copy_slice_from_vtl0_phys(key_pa, &mut *keybuf) } {
+        set_platform_root_key(&*keybuf);
+        Ok(0)
+    } else {
+        Err(VsmError::Vtl0CopyFailed)
+    }
+}
+
 /// VSM function dispatcher
 pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
     let result: Result<i64, VsmError> = match func_id {
@@ -917,6 +942,7 @@ pub fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
             let size: usize = params[1].truncate();
             mshv_vsm_allocate_ringbuffer_memory(params[0], size)
         }
+        VsmFunction::SetPlatformRootKey => mshv_vsm_set_platform_root_key(params[0]),
         VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
     };
     match result {

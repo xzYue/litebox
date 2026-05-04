@@ -7,6 +7,7 @@ use crate::{
     Errno, HostInterface, arch::ioport::serial_print_string,
     host::per_cpu_variables::with_per_cpu_variables,
 };
+use zeroize::Zeroizing;
 
 pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
 
@@ -112,6 +113,27 @@ impl litebox::platform::CrngProvider for LvbsLinuxKernel {
             b.copy_from_slice(&random.next_u64().to_ne_bytes()[..b.len()]);
         }
     }
+}
+
+/// Length of the Platform Root Key in bytes.
+pub(crate) const PRK_LEN: usize = 32;
+
+static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
+
+/// Sets the Platform Root Key (PRK) for this platform.
+///
+/// This should be called once during platform initialization with a key derived
+/// from hardware or a boot nonce.
+///
+/// # Panics
+/// Panics if `key` length does not match `PRK_LEN`.
+pub(crate) fn set_platform_root_key(key: &[u8]) {
+    assert_eq!(key.len(), PRK_LEN, "Platform Root Key length mismatch");
+    PRK_ONCE.call_once(|| {
+        let mut prk = Zeroizing::new([0u8; PRK_LEN]);
+        prk.copy_from_slice(key);
+        *prk
+    });
 }
 
 pub struct HostLvbsInterface;

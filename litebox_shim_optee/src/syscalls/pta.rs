@@ -115,8 +115,6 @@ impl Task {
                     let output_addr: usize = output.0.truncate();
                     let output_ptr = UserMutPtr::<u8>::from_usize(output_addr);
 
-                    // TODO: checks whether output is within the secure memory
-
                     // TODO: derive a TA unique key using the hardware unique key (HUK), TA's UUID, and `extra_data`
                     litebox_util_log::debug!(
                         ptr:% = format_args!("{:#x}", output_addr),

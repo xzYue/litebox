@@ -106,7 +106,7 @@ pub enum VsmError {
     OperationNotSupported(&'static str),
 
     // VTL0 Memory Copy Errors
-    #[error("failed to copy data to VTL0")]
+    #[error("failed to copy data from/to VTL0")]
     Vtl0CopyFailed,
 
     // Hypercall Errors

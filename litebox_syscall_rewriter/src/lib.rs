@@ -191,6 +191,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     trampoline_data.extend_from_slice(&trampoline.to_le_bytes());
     // Patch syscalls in-place in buf
     let mut skipped_addrs = Vec::new();
+    let mut syscall_insns_found = false;
     for s in &text_sections {
         let section_data = section_slice_mut(buf, s)?;
         match hook_syscalls_in_section(
@@ -202,11 +203,32 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             trampoline_base_addr, // entry point is at offset 0 of trampoline
             &mut trampoline_data,
         ) {
-            Ok(addrs) => skipped_addrs.extend(addrs),
+            Ok(addrs) => {
+                skipped_addrs.extend(addrs);
+                syscall_insns_found = true;
+            }
             Err(InternalError::NoSyscallInstructionsFound) => {}
             Err(InternalError::Public(e)) => return Err(e),
             Err(e) => unreachable!("unexpected internal error: {e:?}"),
         }
+    }
+
+    if !syscall_insns_found {
+        // No syscall instructions found. Append a header-only marker so the
+        // loader can distinguish "checked by rewriter, nothing to patch" from
+        // "never processed." The trampoline_size=0 sentinel tells the loader
+        // to skip trampoline mapping entirely.
+        // Use the original input (not `buf`) to avoid emitting the phdr
+        // alignment fixup that is only needed for the `object` crate parser.
+        let mut out = input_binary.to_vec();
+        let header = TrampolineHeader64 {
+            magic: *TRAMPOLINE_MAGIC,
+            file_offset: 0,
+            vaddr: 0,
+            trampoline_size: 0,
+        };
+        out.extend_from_slice(header.as_bytes());
+        return Ok(out);
     }
 
     // Build output: [patched ELF][padding to page boundary][trampoline code][header]
@@ -293,7 +315,9 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
         (header.file_offset, header.vaddr, header.trampoline_size);
 
     if trampoline_size == 0 {
-        return false;
+        // Size=0 sentinel: the rewriter processed this binary but found no
+        // syscall instructions. It is already hooked (nothing to do).
+        return true;
     }
     if file_offset % 0x1000 != 0 {
         return false;
@@ -431,18 +455,13 @@ fn hook_syscalls_in_section(
         trampoline_data.extend_from_slice(&presyscall_bytes);
 
         let return_addr = inst.next_ip();
-        // Put jump back location into rcx.
-        let jmp_back_base = checked_add_u64(
-            trampoline_base_addr,
-            trampoline_data.len() as u64 + 7,
-            "x86_64 trampoline jump-back base",
-        )?;
-        trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
-        trampoline_data.extend_from_slice(&rel32_bytes(
-            return_addr,
-            jmp_back_base,
-            "x86_64 trampoline jump-back",
-        )?);
+
+        // LEA RCX, [RIP + 6] — load RCX with the address of the in-trampoline
+        // `post_jmp` (the instruction immediately after the indirect JMP into
+        // the callback). The SA_RESTART handler relies on the invariant that
+        // pt_regs.rcx - 6 points at the indirect JMP itself, so it can rewind
+        // ctx.rip and re-enter the callback.
+        trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x06, 0x00, 0x00, 0x00]);
 
         // Add jmp [rip + offset_to_entry_point]
         trampoline_data.extend_from_slice(&[0xFF, 0x25]);
@@ -457,6 +476,20 @@ fn hook_syscalls_in_section(
             syscall_entry_addr,
             entry_base,
             "x86_64 trampoline entry",
+        )?);
+
+        // post_jmp: JMP rel32 back to the guest instruction following the
+        // original syscall. The callback returns via `jmp rcx` and lands here.
+        let jmp_back_base = checked_add_u64(
+            trampoline_base_addr,
+            trampoline_data.len() as u64 + 5,
+            "x86_64 trampoline jump-back base",
+        )?;
+        trampoline_data.push(0xE9);
+        trampoline_data.extend_from_slice(&rel32_bytes(
+            return_addr,
+            jmp_back_base,
+            "x86_64 trampoline jump-back",
         )?);
 
         // Replace original instructions with jump to trampoline
@@ -538,8 +571,8 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
         return;
     };
 
-    if old_end > buf.len() || new_end > buf.len() {
-        return; // corrupt phdr table or not enough room
+    if new_end > buf.len() {
+        return; // not enough room
     }
 
     // Only relocate when the overwritten bytes are padding. Otherwise this would corrupt the file
@@ -933,9 +966,11 @@ fn hook_syscall_and_after(
         Vec::new()
     };
 
-    // Put jump back location into rcx, via lea rcx, [next instruction]
-    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D]); // LEA RCX, [RIP + disp32]
-    trampoline_data.extend_from_slice(&6u32.to_le_bytes());
+    // LEA RCX, [RIP + 6] — make RCX point at the instruction immediately
+    // following the indirect JMP: the start of postsyscall_bytes (or, when
+    // none, the unconditional JMP back to guest). The SA_RESTART handler
+    // relies on pt_regs.rcx - 6 pointing at the indirect JMP itself.
+    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x06, 0x00, 0x00, 0x00]);
     // Add jmp [rip + offset_to_entry_point]
     trampoline_data.extend_from_slice(&[0xFF, 0x25]);
     // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4
